@@ -234,18 +234,20 @@ async function transcribeVoice(fileId) {
   const link = await bot.getFileLink(fileId);
   const res = await fetch(link);
   const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > 18 * 1024 * 1024) throw new Error('Audio muy largo (máx ~3 min)');
+  if (buf.length > 8 * 1024 * 1024) throw new Error('Audio muy largo (máx ~1 min, manda 10-20 seg)');
   const b64 = buf.toString('base64');
   const prompt = `Transcribe este audio en español y devuelve SOLO JSON: {"texto":"...","intencion":"tarea|pregunta|otro"} Si habla de tarea/examen/trabajo para fecha, intencion=tarea. Si pregunta algo, intencion=pregunta.`;
+  // Rápido: 1 intento por modelo, sin esperas largas
+  let lastErr = null;
   for (const mname of GEMINI_MODELS) {
     try {
       const m = geminiClient.getGenerativeModel({ model: mname });
       const r = await m.generateContent([{ text: prompt }, { inlineData: { data: b64, mimeType: 'audio/ogg' } }]);
       let txt = r.response.text().replace(/```json|```/g, '').trim();
       return JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
-    } catch (e) { console.log(`voice ${mname} fail:`, e.message.slice(0, 200)); }
+    } catch (e) { lastErr = e; console.log(`voice ${mname} fail rápido:`, e.message.slice(0, 150)); }
   }
-  throw new Error('Gemini audio saturado');
+  throw lastErr || new Error('Gemini audio saturado');
 }
 bot.on('voice', async (msg) => {
   await trackChat(msg.chat.id);
