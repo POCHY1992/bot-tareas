@@ -229,6 +229,63 @@ bot.onText(/\/pregunta (.+)/, async (msg, match) => {
   }
 });
 
+// Notas de voz: transcribe con Gemini y actúa como /agregar natural o /pregunta
+async function transcribeVoice(fileId) {
+  const link = await bot.getFileLink(fileId);
+  const res = await fetch(link);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > 18 * 1024 * 1024) throw new Error('Audio muy largo (máx ~3 min)');
+  const b64 = buf.toString('base64');
+  const prompt = `Transcribe este audio en español y devuelve SOLO JSON: {"texto":"...","intencion":"tarea|pregunta|otro"} Si habla de tarea/examen/trabajo para fecha, intencion=tarea. Si pregunta algo, intencion=pregunta.`;
+  for (const mname of GEMINI_MODELS) {
+    try {
+      const m = geminiClient.getGenerativeModel({ model: mname });
+      const r = await m.generateContent([{ text: prompt }, { inlineData: { data: b64, mimeType: 'audio/ogg' } }]);
+      let txt = r.response.text().replace(/```json|```/g, '').trim();
+      return JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+    } catch (e) { console.log(`voice ${mname} fail:`, e.message.slice(0, 200)); }
+  }
+  throw new Error('Gemini audio saturado');
+}
+bot.on('voice', async (msg) => {
+  await trackChat(msg.chat.id);
+  if (!geminiClient) return bot.sendMessage(msg.chat.id, '❌ Falta GEMINI para voz.');
+  await bot.sendChatAction(msg.chat.id, 'typing');
+  try {
+    const t = await transcribeVoice(msg.voice.file_id);
+    const texto = t.texto || '';
+    await bot.sendMessage(msg.chat.id, `🎤 Escuché: "${texto}"`);
+    // Reinyecta como comando: si es tarea -> procesa como /agregar natural, si no -> /pregunta
+    const fakeMsg = { ...msg, text: t.intencion === 'pregunta' ? `/pregunta ${texto}` : `/agregar ${texto}` };
+    // emite manualmente: llama al handler correspondiente vía bot.emit no funciona con onText, así que procesa directo
+    if (t.intencion === 'pregunta') {
+      const lista = await dbList(msg.chat.id);
+      const pendientes = lista.map(fmt).join('\n').slice(0, 2000);
+      const p2 = `Eres ChatGPT para grupo colegio. Tareas:\n${pendientes || 'ninguna'}\nPregunta por voz de ${msg.from.first_name}: ${texto}`;
+      const ans = (await askGemini(p2)).slice(0, 3500);
+      return bot.sendMessage(msg.chat.id, `🤖 ${ans}`);
+    } else {
+      // tarea por voz: parsea como natural
+      const hoy = dayjs().format('YYYY-MM-DD dddd');
+      const p2 = `Hoy es ${hoy}. Extrae tarea y devuelve SOLO JSON: {"materia":"...","tipo":"trabajo|examen|exposicion|proyecto|tarea","descripcion":"...","fecha":"DD-MM-YYYY","dificultad":"facil|media|dificil","horas":1} Texto: "${texto}"`;
+      let txt = (await askGemini(p2)).replace(/```json|```/g, '').trim();
+      const j = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+      const materia = j.materia || 'General', tipo = (j.tipo || 'tarea').toLowerCase(), descripcion = j.descripcion || texto;
+      const m = (j.fecha || '').match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      const fecha = m ? dayjs(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`) : parseFecha(j.fecha || '') || dayjs().add(1, 'day');
+      const dificultad = (j.dificultad || 'media').toLowerCase(), horas = parseInt(j.horas) || 1;
+      const creador = msg.from.username ? '@' + msg.from.username : msg.from.first_name;
+      const id = await dbAdd(msg.chat.id, { materia, tipo, descripcion, fechaEntrega: fecha.toISOString(), dificultad, horas, creador });
+      const offs = offsets(dificultad, horas);
+      const avisos = offs.map(o => fecha.subtract(o, 'day').format('DD MMM')).join(', ');
+      return bot.sendMessage(msg.chat.id, `✅ Por voz #${id}\n📌 ${materia} - ${tipo} ${descripcion}\n📅 ${fecha.format('DD MMM dddd')}\n⚠️ ${dificultad} (${horas}h)\n⏰ Avisaré: ${avisos}`);
+    }
+  } catch (e) {
+    console.log('voice fail:', e.message);
+    bot.sendMessage(msg.chat.id, '😅 No entendí la nota de voz, habla 10-20 seg claro e inténtalo de nuevo.');
+  }
+});
+
 // Recordatorios cada hora
 cron.schedule('0 * * * *', async () => {
   const hoy = dayjs().startOf('day');
