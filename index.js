@@ -17,14 +17,78 @@ if (!TOKEN) { console.error('Falta TELEGRAM_TOKEN en .env'); process.exit(1); }
 const bot = new TelegramBot(TOKEN, { polling: true });
 const DB_FILE = './db.json';
 
+// --- Storage: Supabase (persistente) con fallback a JSON local ---
+const SUPA_URL = process.env.SUPABASE_URL;
+const SUPA_KEY = process.env.SUPABASE_KEY;
+let supa = null;
+if (SUPA_URL && SUPA_KEY && !SUPA_KEY.includes('PEGA')) {
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    supa = createClient(SUPA_URL, SUPA_KEY);
+    console.log('✅ Supabase activado');
+  } catch (e) { console.log('supabase init fail:', e.message); }
+}
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ tareas: [], grupos: [] }, null, 2));
   return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 }
 function saveDB(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
-function trackChat(id) {
+async function trackChat(id) {
+  if (supa) { try { await supa.from('grupos').upsert({ id: String(id) }, { onConflict: 'id' }); } catch (e) {} return; }
   const db = loadDB();
   if (!db.grupos.includes(id)) { db.grupos.push(id); saveDB(db); }
+}
+async function dbList(chatId) {
+  if (supa) {
+    const { data } = await supa.from('tareas').select('*').eq('chat_id', String(chatId)).eq('completada', false).order('fecha_entrega');
+    return (data || []).map(t => ({ id: t.nid, materia: t.materia, tipo: t.tipo, descripcion: t.descripcion, fechaEntrega: t.fecha_entrega, dificultad: t.dificultad, horas: t.horas, creador: t.creador, chatId: Number(t.chat_id), avisados: t.avisados || [], completada: t.completada }));
+  }
+  const db = loadDB();
+  return db.tareas.filter(x => !x.completada && (String(x.chatId) === String(chatId) || !x.chatId));
+}
+async function dbAdd(chatId, d) {
+  if (supa) {
+    const { data: max } = await supa.from('tareas').select('nid').eq('chat_id', String(chatId)).order('nid', { ascending: false }).limit(1);
+    const nid = ((max && max[0]?.nid) || 0) + 1;
+    await supa.from('tareas').insert({ chat_id: String(chatId), nid, materia: d.materia, tipo: d.tipo, descripcion: d.descripcion, fecha_entrega: d.fechaEntrega, dificultad: d.dificultad, horas: d.horas, creador: d.creador, avisados: [], completada: false });
+    return nid;
+  }
+  const db = loadDB();
+  const id = (db.tareas.at(-1)?.id || 0) + 1;
+  db.tareas.push({ id, ...d, chatId, avisados: [], completada: false });
+  saveDB(db);
+  return id;
+}
+async function dbDone(chatId, nid) {
+  if (supa) { const { data } = await supa.from('tareas').update({ completada: true }).eq('chat_id', String(chatId)).eq('nid', nid).select(); return (data || [])[0]; }
+  const db = loadDB();
+  const t = db.tareas.find(x => x.id === nid && (String(x.chatId) === String(chatId) || !x.chatId));
+  if (t) { t.completada = true; saveDB(db); }
+  return t;
+}
+async function dbDel(chatId, nid) {
+  if (supa) { await supa.from('tareas').delete().eq('chat_id', String(chatId)).eq('nid', nid); return; }
+  const db = loadDB();
+  db.tareas = db.tareas.filter(x => !(x.id === nid && (String(x.chatId) === String(chatId) || !x.chatId)));
+  saveDB(db);
+}
+async function dbAllPending() {
+  if (supa) {
+    const { data } = await supa.from('tareas').select('*').eq('completada', false);
+    return (data || []).map(t => ({ id: t.nid, dbId: t.id, materia: t.materia, tipo: t.tipo, descripcion: t.descripcion, fechaEntrega: t.fecha_entrega, dificultad: t.dificultad, horas: t.horas, creador: t.creador, chatId: t.chat_id, avisados: t.avisados || [] }));
+  }
+  return loadDB().tareas.filter(x => !x.completada);
+}
+async function dbMarkAvisado(t, diff) {
+  const nav = [...(t.avisados || []), diff];
+  if (supa && t.dbId) { await supa.from('tareas').update({ avisados: nav }).eq('id', t.dbId); return; }
+  const db = loadDB();
+  const lt = db.tareas.find(x => x.id === t.id);
+  if (lt) { lt.avisados.push(diff); saveDB(db); }
+}
+async function dbGrupos() {
+  if (supa) { const { data } = await supa.from('grupos').select('id'); return (data || []).map(g => g.id); }
+  return loadDB().grupos;
 }
 
 function parseFecha(str) {
@@ -52,13 +116,13 @@ function fmt(t) {
   return `#${t.id} 📌 ${t.materia} - ${t.tipo} ${t.descripcion}\n   📅 ${f} ${cuando} | ⚠️ ${t.dificultad} ${t.horas}h 👤 ${t.creador}`;
 }
 
-bot.onText(/\/start|\/ayuda|\/help/, (msg) => {
-  trackChat(msg.chat.id);
+bot.onText(/\/start|\/ayuda|\/help/, async (msg) => {
+  await trackChat(msg.chat.id);
   bot.sendMessage(msg.chat.id, `🤖 Bot Tareas Colegio\n\nEscríbeme natural, sin formato raro:\n/agregar tarea portada de naturales para el lunes de biología\n/agregar examen de matemáticas fracciones para el 12-09 difícil\n\nO con formato:\n/agregar Matematicas | examen fracciones | 12-09 | dificil | 4 horas\n\n/ver - pendientes\n/listo 5\n/borrar 5\n/pregunta lo que sea - IA general`);
 });
 
 bot.onText(/\/agregar (.+)/, async (msg, match) => {
-  trackChat(msg.chat.id);
+  await trackChat(msg.chat.id);
   const resto = match[1];
   const partes = resto.split('|').map(s => s.trim());
   let materia, tipo, descripcion, fecha, dificultad, horas;
@@ -90,44 +154,35 @@ bot.onText(/\/agregar (.+)/, async (msg, match) => {
     }
   }
   if (!fecha || !fecha.isValid()) return bot.sendMessage(msg.chat.id, '❌ Fecha no entendida. Usa 12-09, mañana, lunes, etc.');
-  const db = loadDB();
-  const id = (db.tareas.at(-1)?.id || 0) + 1;
   const offs = offsets(dificultad, horas);
   const avisos = offs.map(o => fecha.subtract(o,'day').format('DD MMM')).join(', ');
   const creador = msg.from.username ? '@'+msg.from.username : msg.from.first_name;
-  db.tareas.push({ id, materia, tipo, descripcion, fechaEntrega: fecha.toISOString(), dificultad, horas, creador, chatId: msg.chat.id, avisados: [], completada: false });
-  saveDB(db);
-  bot.sendMessage(msg.chat.id, `✅ Tarea guardada #${id}\n📌 ${materia} - ${tipo} ${descripcion}\n📅 Entrega: ${fecha.format('DD MMM dddd')}\n⚠️ Dificultad: ${dificultad} (${horas}h)\n⏰ Les avisaré el: ${avisos}\n👤 Puesta por ${creador}`);
+  const id = await dbAdd(msg.chat.id, { materia, tipo, descripcion, fechaEntrega: fecha.toISOString(), dificultad, horas, creador });
+  bot.sendMessage(msg.chat.id, `✅ Tarea guardada #${id}\n📌 ${materia} - ${tipo} ${descripcion}\n📅 Entrega: ${fecha.format('DD MMM dddd')}\n⚠️ Dificultad: ${dificultad} (${horas}h)\n⏰ Les avisaré solo el: ${avisos}\n👤 Puesta por ${creador}`);
 });
 
-bot.onText(/\/ver(.*)/, (msg, match) => {
-  trackChat(msg.chat.id);
-  const db = loadDB();
-  // solo tareas de este grupo
-  let lista = db.tareas.filter(x => !x.completada && (x.chatId === msg.chat.id || !x.chatId));
+bot.onText(/\/ver(.*)/, async (msg, match) => {
+  await trackChat(msg.chat.id);
+  let lista = await dbList(msg.chat.id);
   if ((match[1]||'').includes('examen')) lista = lista.filter(x => x.tipo.includes('examen'));
   if (!lista.length) return bot.sendMessage(msg.chat.id, '🎉 No hay tareas pendientes.');
   lista.sort((a,b)=> dayjs(a.fechaEntrega)-dayjs(b.fechaEntrega));
   bot.sendMessage(msg.chat.id, '📝 Pendientes:\n\n' + lista.map(fmt).join('\n\n'));
 });
 
-bot.onText(/\/listo (\d+)/, (msg, match) => {
-  trackChat(msg.chat.id);
+bot.onText(/\/listo (\d+)/, async (msg, match) => {
+  await trackChat(msg.chat.id);
   const id = parseInt(match[1]);
-  const db = loadDB();
-  const t = db.tareas.find(x => x.id === id && (x.chatId === msg.chat.id || !x.chatId));
+  const t = await dbDone(msg.chat.id, id);
   if (!t) return bot.sendMessage(msg.chat.id, '❌ No encontré ese #id en este grupo.');
-  t.completada = true; saveDB(db);
   const quien = msg.from.username ? '@'+msg.from.username : msg.from.first_name;
-  bot.sendMessage(msg.chat.id, `🎉 Bien ${quien}! #${id} ${t.materia} marcada como hecha.`);
+  bot.sendMessage(msg.chat.id, `🎉 Bien ${quien}! #${id} marcada como hecha.`);
 });
 
-bot.onText(/\/borrar (\d+)/, (msg, match) => {
-  trackChat(msg.chat.id);
+bot.onText(/\/borrar (\d+)/, async (msg, match) => {
+  await trackChat(msg.chat.id);
   const id = parseInt(match[1]);
-  const db = loadDB();
-  db.tareas = db.tareas.filter(x => !(x.id === id && (x.chatId === msg.chat.id || !x.chatId)));
-  saveDB(db);
+  await dbDel(msg.chat.id, id);
   bot.sendMessage(msg.chat.id, `🗑️ Tarea #${id} borrada.`);
 });
 
@@ -163,9 +218,9 @@ bot.onText(/\/pregunta (.+)/, async (msg, match) => {
   if (!geminiClient) return bot.sendMessage(msg.chat.id, '❌ Falta GEMINI_API_KEY.');
   await bot.sendChatAction(msg.chat.id, 'typing');
   try {
-    const db = loadDB();
-    const pendientes = db.tareas.filter(x => !x.completada && x.chatId === msg.chat.id).map(fmt).join('\n').slice(0, 2000);
-    const prompt = `Eres como ChatGPT / Gemini para un grupo de 4 amigos de colegio. Respondes CUALQUIER pregunta general (ciencia, historia, universo, tareas, matemáticas, etc), en español, claro y útil, como si te preguntaran a la Gemini directa.\nSi la pregunta es sobre tareas, usa este contexto:\nTareas pendientes del grupo:\n${pendientes || 'ninguna'}\n\nPregunta de ${msg.from.first_name}: ${q}\nResponde completo pero sin rollo excesivo.`;
+    const lista = await dbList(msg.chat.id);
+    const pendientes = lista.map(fmt).join('\n').slice(0, 2000);
+    const prompt = `Eres como ChatGPT / Gemini para un grupo de 4 amigos de colegio. Respondes CUALQUIER pregunta general (ciencia, historia, universo, tareas, matemáticas, etc), en español, claro y útil.\nIMPORTANTE sobre recordatorios: este bot SÍ envía recordatorios automáticos solo al grupo (según dificultad: facil 1 día antes, media 3 y 1 día antes, dificil 7,3,1 día antes + día entrega) + resumen diario 7pm. Nunca digas que no puedes avisar automático. Si preguntan "me recuerdas el domingo?", responde "Sí, te avisaré solo esos días: ..." usando las fechas.\nTareas pendientes del grupo:\n${pendientes || 'ninguna'}\n\nPregunta de ${msg.from.first_name}: ${q}`;
     let txt = (await askGemini(prompt)).slice(0, 3500);
     bot.sendMessage(msg.chat.id, `🤖 ${txt}`);
   } catch (e) {
@@ -176,29 +231,25 @@ bot.onText(/\/pregunta (.+)/, async (msg, match) => {
 
 // Recordatorios cada hora
 cron.schedule('0 * * * *', async () => {
-  const db = loadDB();
   const hoy = dayjs().startOf('day');
-  let changed = false;
-  for (const t of db.tareas.filter(x => !x.completada)) {
+  for (const t of await dbAllPending()) {
     const entrega = dayjs(t.fechaEntrega).startOf('day');
     const diff = entrega.diff(hoy, 'day');
     const offs = offsets(t.dificultad, t.horas);
-    if (offs.includes(diff) && !t.avisados.includes(diff)) {
+    if (offs.includes(diff) && !(t.avisados || []).includes(diff)) {
       const msg = diff === 0
         ? `⏰ ¡HOY SE ENTREGA! #${t.id} ${t.materia} - ${t.tipo} ${t.descripcion} ¡háganla ya!`
         : `⏰ Recordatorio #${t.id} ${t.materia} - ${t.tipo} ${t.descripcion}\n📅 Entrega ${entrega.format('DD MMM')} (en ${diff} días) ⚠️ ${t.dificultad}`;
-      try { await bot.sendMessage(t.chatId || db.grupos[0], msg); } catch(e){ console.log('No se pudo avisar:', e.message); }
-      t.avisados.push(diff); changed = true;
+      try { await bot.sendMessage(t.chatId, msg); } catch(e){ console.log('No se pudo avisar:', e.message); }
+      await dbMarkAvisado(t, diff);
     }
   }
-  if (changed) saveDB(db);
 });
 
 // Resumen diario 7pm
 cron.schedule('0 19 * * *', async () => {
-  const db = loadDB();
-  for (const gid of db.grupos) {
-    const pendientes = db.tareas.filter(x => !x.completada && x.chatId === gid).sort((a,b)=> dayjs(a.fechaEntrega)-dayjs(b.fechaEntrega));
+  for (const gid of await dbGrupos()) {
+    const pendientes = (await dbList(gid)).sort((a,b)=> dayjs(a.fechaEntrega)-dayjs(b.fechaEntrega));
     if (!pendientes.length) continue;
     bot.sendMessage(gid, '📝 Resumen diario:\n\n' + pendientes.map(fmt).join('\n\n'));
   }
