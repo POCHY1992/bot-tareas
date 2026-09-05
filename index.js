@@ -212,15 +212,19 @@ async function askGemini(prompt) {
   throw lastErr;
 }
 
-bot.onText(/\/pregunta (.+)/, async (msg, match) => {
-  trackChat(msg.chat.id);
-  const q = match[1];
+bot.onText(/\/pregunta(.*)/, async (msg, match) => {
+  await trackChat(msg.chat.id);
+  let q = (match[1] || '').trim();
+  // Si responde con reply al mensaje del bot, usa ese contexto
+  const replyCtx = msg.reply_to_message?.text?.slice(0, 1500) || '';
+  if (!q && replyCtx) q = 'continúa / aclara lo anterior';
+  if (!q) return bot.sendMessage(msg.chat.id, '❌ Escribe: /pregunta tu duda\nEj: /pregunta qué es el universo en química?\nTip: puedes darle Responder al mensaje del bot y poner /pregunta sí, explícame más');
   if (!geminiClient) return bot.sendMessage(msg.chat.id, '❌ Falta GEMINI_API_KEY.');
   await bot.sendChatAction(msg.chat.id, 'typing');
   try {
     const lista = await dbList(msg.chat.id);
     const pendientes = lista.map(fmt).join('\n').slice(0, 2000);
-    const prompt = `Eres como ChatGPT / Gemini para un grupo de 4 amigos de colegio. Respondes CUALQUIER pregunta general (ciencia, historia, universo, tareas, matemáticas, etc), en español, claro y útil.\nIMPORTANTE sobre recordatorios: este bot SÍ envía recordatorios automáticos solo al grupo (según dificultad: facil 1 día antes, media 3 y 1 día antes, dificil 7,3,1 día antes + día entrega) + resumen diario 7pm. Nunca digas que no puedes avisar automático. Si preguntan "me recuerdas el domingo?", responde "Sí, te avisaré solo esos días: ..." usando las fechas.\nTareas pendientes del grupo:\n${pendientes || 'ninguna'}\n\nPregunta de ${msg.from.first_name}: ${q}`;
+    const prompt = `Eres ChatGPT para grupo de colegio.IMPORTANTE: mantén el hilo. Si hay contexto anterior, responde como continuación, no desde cero. No te confundas con "si/no" cortos: interpretalos como "sí, explícame más / dame ejemplo".\nContexto anterior del bot:\n${replyCtx || 'ninguno'}\nTareas:\n${pendientes || 'ninguna'}\nPregunta de ${msg.from.first_name}: ${q}`;
     let txt = (await askGemini(prompt)).slice(0, 3500);
     bot.sendMessage(msg.chat.id, `🤖 ${txt}`);
   } catch (e) {
