@@ -255,13 +255,11 @@ bot.on('voice', async (msg) => {
     const t = await transcribeVoice(msg.voice.file_id);
     const texto = t.texto || '';
     await bot.sendMessage(msg.chat.id, `🎤 Escuché: "${texto}"`);
-    // Reinyecta como comando: si es tarea -> procesa como /agregar natural, si no -> /pregunta
-    const fakeMsg = { ...msg, text: t.intencion === 'pregunta' ? `/pregunta ${texto}` : `/agregar ${texto}` };
-    // emite manualmente: llama al handler correspondiente vía bot.emit no funciona con onText, así que procesa directo
-    if (t.intencion === 'pregunta') {
+    // Si es tarea -> guarda, si no (pregunta u otro) -> responde como ChatGPT
+    if ((t.intencion || '').toLowerCase() !== 'tarea') {
       const lista = await dbList(msg.chat.id);
       const pendientes = lista.map(fmt).join('\n').slice(0, 2000);
-      const p2 = `Eres ChatGPT para grupo colegio. Tareas:\n${pendientes || 'ninguna'}\nPregunta por voz de ${msg.from.first_name}: ${texto}`;
+      const p2 = `Eres ChatGPT / Gemini para grupo de colegio. Respondes CUALQUIER pregunta general en español, claro y útil. Tareas pendientes para contexto:\n${pendientes || 'ninguna'}\nPregunta por voz de ${msg.from.first_name}: ${texto}`;
       const ans = (await askGemini(p2)).slice(0, 3500);
       return bot.sendMessage(msg.chat.id, `🤖 ${ans}`);
     } else {
