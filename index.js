@@ -73,13 +73,12 @@ bot.onText(/\/agregar (.+)/, async (msg, match) => {
     horas = parseInt((partes[4]||'1').match(/\d+/)?.[0] || '1');
   } else {
     // Lenguaje natural con Gemini: "/agregar tarea de hoy portada de naturales para el lunes..."
-    if (!gemini) return bot.sendMessage(msg.chat.id, '❌ Escribe con formato o activa Gemini. Ej:\n/agregar tarea portada naturales para el lunes biología');
+    if (typeof geminiClient === 'undefined' || !geminiClient) return bot.sendMessage(msg.chat.id, '❌ Escribe con formato o activa Gemini. Ej:\n/agregar tarea portada naturales para el lunes biología');
     await bot.sendChatAction(msg.chat.id, 'typing');
     try {
       const hoy = dayjs().format('YYYY-MM-DD dddd');
       const prompt = `Hoy es ${hoy}. Extrae una tarea escolar del texto y devuelve SOLO JSON válido sin markdown: {"materia": "...", "tipo": "trabajo|examen|exposicion|proyecto|tarea", "descripcion": "...", "fecha": "DD-MM-YYYY", "dificultad": "facil|media|dificil", "horas": 1}\nReglas: si dice "lunes" calcula el próximo lunes desde hoy. Si no dice dificultad, estima: portada/dibujo=facil 1h, examen=dificil 3h, trabajo=media 2h. Texto: "${resto}"`;
-      const r = await gemini.generateContent(prompt);
-      let txt = r.response.text().replace(/```json|```/g, '').trim();
+      let txt = (await askGemini(prompt)).replace(/```json|```/g, '').trim();
       const j = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
       materia = j.materia || 'General'; tipo = (j.tipo || 'tarea').toLowerCase(); descripcion = j.descripcion || resto;
       const m = (j.fecha || '').match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
@@ -132,29 +131,46 @@ bot.onText(/\/borrar (\d+)/, (msg, match) => {
   bot.sendMessage(msg.chat.id, `🗑️ Tarea #${id} borrada.`);
 });
 
-// Gemini /pregunta
+// Gemini /pregunta con fallback y reintento (el 503 es sobrecarga temporal de Google)
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-let gemini = null;
+const GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3-flash', 'gemini-2.5-flash'];
+let geminiClient = null;
 if (GEMINI_KEY && !GEMINI_KEY.includes('PEGA_AQUI')) {
-  gemini = new GoogleGenerativeAI(GEMINI_KEY).getGenerativeModel({ model: 'gemini-3.6-flash' });
+  geminiClient = new GoogleGenerativeAI(GEMINI_KEY);
+}
+async function askGemini(prompt) {
+  let lastErr = null;
+  for (const mname of GEMINI_MODELS) {
+    for (let intento = 0; intento < 2; intento++) {
+      try {
+        const m = geminiClient.getGenerativeModel({ model: mname });
+        const r = await m.generateContent(prompt);
+        return r.response.text();
+      } catch (e) {
+        lastErr = e;
+        console.log(`gemini ${mname} intento ${intento + 1} fail:`, e.message.slice(0, 200));
+        await new Promise(r => setTimeout(r, 2000 * (intento + 1)));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 bot.onText(/\/pregunta (.+)/, async (msg, match) => {
   trackChat(msg.chat.id);
   const q = match[1];
-  if (!gemini) return bot.sendMessage(msg.chat.id, '❌ Falta GEMINI_API_KEY en .env. Saca una gratis en https://aistudio.google.com/app/apikey y pégala.');
+  if (!geminiClient) return bot.sendMessage(msg.chat.id, '❌ Falta GEMINI_API_KEY.');
   await bot.sendChatAction(msg.chat.id, 'typing');
   try {
     const db = loadDB();
     const pendientes = db.tareas.filter(x => !x.completada && x.chatId === msg.chat.id).map(fmt).join('\n').slice(0, 2000);
     const prompt = `Eres como ChatGPT / Gemini para un grupo de 4 amigos de colegio. Respondes CUALQUIER pregunta general (ciencia, historia, universo, tareas, matemáticas, etc), en español, claro y útil, como si te preguntaran a la Gemini directa.\nSi la pregunta es sobre tareas, usa este contexto:\nTareas pendientes del grupo:\n${pendientes || 'ninguna'}\n\nPregunta de ${msg.from.first_name}: ${q}\nResponde completo pero sin rollo excesivo.`;
-    const r = await gemini.generateContent(prompt);
-    let txt = r.response.text().slice(0, 3500);
+    let txt = (await askGemini(prompt)).slice(0, 3500);
     bot.sendMessage(msg.chat.id, `🤖 ${txt}`);
   } catch (e) {
-    console.log('gemini error:', e.message);
-    bot.sendMessage(msg.chat.id, '❌ Gemini falló: ' + e.message.slice(0, 200));
+    console.log('gemini error final:', e.message);
+    bot.sendMessage(msg.chat.id, '😅 Gemini está saturado ahorita (error 503 de Google). Espera 1 min y prueba de nuevo:\n/pregunta ' + q);
   }
 });
 
