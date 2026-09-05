@@ -54,22 +54,43 @@ function fmt(t) {
 
 bot.onText(/\/start|\/ayuda|\/help/, (msg) => {
   trackChat(msg.chat.id);
-  bot.sendMessage(msg.chat.id, `🤖 Bot Tareas Colegio\n\n/agregar Matematicas | examen fracciones | 12-09 | dificil | 4 horas\n/ver - ver pendientes\n/ver examenes\n/listo 5 - marcar hecha\n/borrar 5\n/pregunta que tengo mañana? - pregunta a Gemini IA\n\nCualquiera del grupo puede agregar y a todos les avisa.`);
+  bot.sendMessage(msg.chat.id, `🤖 Bot Tareas Colegio\n\nEscríbeme natural, sin formato raro:\n/agregar tarea portada de naturales para el lunes de biología\n/agregar examen de matemáticas fracciones para el 12-09 difícil\n\nO con formato:\n/agregar Matematicas | examen fracciones | 12-09 | dificil | 4 horas\n\n/ver - pendientes\n/listo 5\n/borrar 5\n/pregunta lo que sea - IA general`);
 });
 
-bot.onText(/\/agregar (.+)/, (msg, match) => {
+bot.onText(/\/agregar (.+)/, async (msg, match) => {
   trackChat(msg.chat.id);
   const resto = match[1];
   const partes = resto.split('|').map(s => s.trim());
-  if (partes.length < 3) return bot.sendMessage(msg.chat.id, '❌ Usa:\n/agregar Materia | tipo descripcion | fecha | dificultad | horas\nEj:\n/agregar Matematicas | examen fracciones | 12-09 | dificil | 4 horas');
-  const materia = partes[0];
-  const td = partes[1].split(' ');
-  const tipo = (td[0]||'tarea').toLowerCase();
-  const descripcion = td.slice(1).join(' ') || tipo;
-  const fecha = parseFecha(partes[2]||'');
-  if (!fecha) return bot.sendMessage(msg.chat.id, '❌ Fecha no entendida. Usa 12-09, 12/09/2026, mañana, hoy');
-  const dificultad = (partes[3]||'media').toLowerCase();
-  const horas = parseInt((partes[4]||'1').match(/\d+/)?.[0] || '1');
+  let materia, tipo, descripcion, fecha, dificultad, horas;
+
+  if (partes.length >= 3) {
+    materia = partes[0];
+    const td = partes[1].split(' ');
+    tipo = (td[0]||'tarea').toLowerCase();
+    descripcion = td.slice(1).join(' ') || tipo;
+    fecha = parseFecha(partes[2]||'');
+    dificultad = (partes[3]||'media').toLowerCase();
+    horas = parseInt((partes[4]||'1').match(/\d+/)?.[0] || '1');
+  } else {
+    // Lenguaje natural con Gemini: "/agregar tarea de hoy portada de naturales para el lunes..."
+    if (!gemini) return bot.sendMessage(msg.chat.id, '❌ Escribe con formato o activa Gemini. Ej:\n/agregar tarea portada naturales para el lunes biología');
+    await bot.sendChatAction(msg.chat.id, 'typing');
+    try {
+      const hoy = dayjs().format('YYYY-MM-DD dddd');
+      const prompt = `Hoy es ${hoy}. Extrae una tarea escolar del texto y devuelve SOLO JSON válido sin markdown: {"materia": "...", "tipo": "trabajo|examen|exposicion|proyecto|tarea", "descripcion": "...", "fecha": "DD-MM-YYYY", "dificultad": "facil|media|dificil", "horas": 1}\nReglas: si dice "lunes" calcula el próximo lunes desde hoy. Si no dice dificultad, estima: portada/dibujo=facil 1h, examen=dificil 3h, trabajo=media 2h. Texto: "${resto}"`;
+      const r = await gemini.generateContent(prompt);
+      let txt = r.response.text().replace(/```json|```/g, '').trim();
+      const j = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+      materia = j.materia || 'General'; tipo = (j.tipo || 'tarea').toLowerCase(); descripcion = j.descripcion || resto;
+      const m = (j.fecha || '').match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      fecha = m ? dayjs(`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`) : parseFecha(j.fecha || '') || dayjs().add(1, 'day');
+      dificultad = (j.dificultad || 'media').toLowerCase(); horas = parseInt(j.horas) || 1;
+    } catch (e) {
+      console.log('parse natural fail:', e.message);
+      return bot.sendMessage(msg.chat.id, '❌ No te entendí. Prueba:\n/agregar naturales portada biología para el lunes');
+    }
+  }
+  if (!fecha || !fecha.isValid()) return bot.sendMessage(msg.chat.id, '❌ Fecha no entendida. Usa 12-09, mañana, lunes, etc.');
   const db = loadDB();
   const id = (db.tareas.at(-1)?.id || 0) + 1;
   const offs = offsets(dificultad, horas);
@@ -77,7 +98,7 @@ bot.onText(/\/agregar (.+)/, (msg, match) => {
   const creador = msg.from.username ? '@'+msg.from.username : msg.from.first_name;
   db.tareas.push({ id, materia, tipo, descripcion, fechaEntrega: fecha.toISOString(), dificultad, horas, creador, chatId: msg.chat.id, avisados: [], completada: false });
   saveDB(db);
-  bot.sendMessage(msg.chat.id, `✅ Tarea guardada #${id}\n📌 ${materia} - ${tipo} ${descripcion}\n📅 Entrega: ${fecha.format('DD MMM')}\n⚠️ Dificultad: ${dificultad} (${horas}h)\n⏰ Les avisaré el: ${avisos}\n👤 Puesta por ${creador}`);
+  bot.sendMessage(msg.chat.id, `✅ Tarea guardada #${id}\n📌 ${materia} - ${tipo} ${descripcion}\n📅 Entrega: ${fecha.format('DD MMM dddd')}\n⚠️ Dificultad: ${dificultad} (${horas}h)\n⏰ Les avisaré el: ${avisos}\n👤 Puesta por ${creador}`);
 });
 
 bot.onText(/\/ver(.*)/, (msg, match) => {
